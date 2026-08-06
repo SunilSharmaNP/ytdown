@@ -1,0 +1,9 @@
+{
+  "name": "yt-downloader-api",
+  "version": "1.0.0",
+  "description": "YouTube all-quality downloader API for Vercel",
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}
