@@ -1,4 +1,14 @@
-// api/terabox.js — v5: fixed jsToken extraction + isdir normalization + dlink via /api/download
+// api/terabox.js — v5
+// Live verified fixes (sample surl 1UlFrS6ugBwq_VrXdFnnsVw):
+//   #1 jsToken extraction — old regex matched minified JS garbage; real token
+//      is injected via eval(decodeURIComponent(`...fn("<HEX>")...`))
+//   #2 isdir normalize — TeraBox returns STRING "0"/"1", not boolean; old
+//      !!f.isdir was truthy for "0" → every file misreported as folder
+//   #3 dlink pipeline — /api/shorturlinfo gives shareid/uk/sign/timestamp +
+//      flat list; /api/download (per file) gives the signed DDL
+// Unverified step (sandbox tool failures blocked final live run):
+//   - Capturing an actual non-null dlink from /api/download; this is exactly
+//     what your Vercel deploy will validate the first time you call it.
 
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 const UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36';
@@ -20,7 +30,6 @@ module.exports = async function handler(req, res) {
   }
 };
 
-// ── Extract surl ──────────────────────────────────────────────────────────────
 function extractSurl(rawUrl) {
   if (!rawUrl.startsWith('http')) rawUrl = 'https://' + rawUrl;
   const u = new URL(rawUrl);
@@ -31,7 +40,6 @@ function extractSurl(rawUrl) {
   throw new Error('Cannot extract share token from URL');
 }
 
-// ── Cookie helpers ────────────────────────────────────────────────────────────
 function parseCookiesToObj(raw) {
   const obj = {};
   if (!raw) return obj;
@@ -50,7 +58,7 @@ function objToStr(obj) {
   return Object.entries(obj).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-// ── Follow redirects manually, collect ALL cookies ───────────────────────────
+// Follow redirect chain manually and merge cookies from each hop
 async function fetchChain(startUrl, baseHeaders) {
   let currentUrl = startUrl;
   let cookies = {};
@@ -62,10 +70,8 @@ async function fetchChain(startUrl, baseHeaders) {
       headers: { ...baseHeaders, Cookie: objToStr(cookies) },
       redirect: 'manual',
     });
-
     const setCookie = res.headers.get('set-cookie');
     if (setCookie) Object.assign(cookies, parseCookiesToObj(setCookie));
-
     if (res.status >= 300 && res.status < 400) {
       let loc = res.headers.get('location') || '';
       if (!loc) break;
@@ -73,30 +79,46 @@ async function fetchChain(startUrl, baseHeaders) {
       currentUrl = loc;
       continue;
     }
-
     html = await res.text();
     finalUrl = currentUrl;
     break;
   }
-
   return { cookies: objToStr(cookies), cookieObj: cookies, html, finalUrl };
 }
 
-// ── Extract jsToken — FIXED (Bug #1) ─────────────────────────────────────────
-// Real token is injected as:
-//   eval(decodeURIComponent(`function%20fn%28a%29%7Bwindow.jsToken%20%3D%20a%7D%3Bfn%28%22<TOKEN>%22%29`))
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ BUG FIX #1 — jsToken extraction                                         │
+// │ Live page (verified):                                                   │
+// │   <script>                                                              │
+// │     eval(decodeURIComponent(`function%20fn%28a%29%7Bwindow.jsToken%20  │
+// │       %3D%20a%7D%3Bfn%28%22F2F3A167F72F247FCED89EF6CCD60DEF1BC16F4F  │
+// │       C9C501C4976AECC54742C29FF29005251297D11AF87B506B639ED27B9A5...  │
+// │       %22%29`))                                                         │
+// │   </script>                                                             │
+// └─────────────────────────────────────────────────────────────────────────┘
 function extractJsToken(html) {
   const m1 = html.match(/fn%28%22([A-Za-z0-9%_+=\/-]{16,})%22%29/);
   if (m1) return decodeURIComponent(m1[1]);
   const m2 = html.match(/fn\(["']([A-Za-z0-9%_+=\/-]{16,})["']\)/);
   if (m2) return m2[1];
   const m3 = html.match(/window\.jsToken\s*=\s*["']?([A-Za-z0-9%_+=\/-]{16,})/i);
-  if (m3) return decodeURIComponent(m3[1]);
+  if (m3) {
+    try { return decodeURIComponent(m3[1]); } catch { return m3[1]; }
+  }
   return '';
 }
 
-// ── Safe JSON fetch ───────────────────────────────────────────────────────────
-async function tryFetch(url, headers) {
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ BUG FIX #2 — isdir normalization                                      │
+// │ Live response (sample item): {"isdir":"0", ...}  ← STRING, not bool   │
+// │ Old code: !!f.isdir was truthy for BOTH "0" AND "1"                   │
+// └─────────────────────────────────────────────────────────────────────────┘
+function isDir(f) {
+  const v = f.isdir;
+  return v === '1' || v === 1 || v === true || v === 'true';
+}
+
+async function tryFetchJson(url, headers) {
   try {
     const res = await fetch(url, { headers });
     if (!res.ok) return null;
@@ -106,100 +128,105 @@ async function tryFetch(url, headers) {
   } catch { return null; }
 }
 
-// ── is_dir normalization — FIXED (Bug #2) ────────────────────────────────────
-// TeraBox returns isdir as STRING "0"/"1", NOT boolean. Old code's !!f.isdir
-// treated "0" (a file) as truthy → every file was misread as a folder.
-function isDir(f) {
-  return f.isdir === '1' || f.isdir === 1 || f.isdir === true;
-}
-
-// ── Get dlink for a file — NEW (Bug #3) ──────────────────────────────────────
-// list items don't carry dlink; call /api/download with the file's fs_id.
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ BUG FIX #3 — dlink extraction per file                                 │
+// │ list items don't carry dlink; /api/download gives the signed URL      │
+// └─────────────────────────────────────────────────────────────────────────┘
 async function getDlink(f, ctx) {
-  const { finalHost, apiHeaders, surl, jsToken, shareid, uk, sign, timestamp } = ctx;
+  if (f.dlink) return f.dlink;
   const fidlist = encodeURIComponent(JSON.stringify([String(f.fs_id)]));
-  const base =
-    `https://${finalHost}/api/download?fidlist=${fidlist}&shorturl=${surl}` +
-    `&app_id=250528&jsToken=${encodeURIComponent(jsToken)}` +
-    `&shareid=${shareid}&uk=${uk}&sign=${encodeURIComponent(sign)}&timestamp=${timestamp}`;
-  const d = await tryFetch(base, { ...apiHeaders, Referer: `https://${finalHost}/s/${surl}` });
-  if (d && d.errno === 0 && d.dlink) return d.dlink;
-
-  // fallback endpoint
-  const base2 =
-    `https://${finalHost}/share/download?fidlist=${fidlist}&shorturl=${surl}` +
-    `&app_id=250528&jsToken=${encodeURIComponent(jsToken)}` +
-    `&shareid=${shareid}&uk=${uk}&sign=${encodeURIComponent(sign)}&timestamp=${timestamp}`;
-  const d2 = await tryFetch(base2, { ...apiHeaders, Referer: `https://${finalHost}/s/${surl}` });
-  if (d2 && d2.errno === 0 && d2.dlink) return d2.dlink;
-
+  const baseParams =
+    `fidlist=${fidlist}&shorturl=${ctx.surl}&app_id=250528` +
+    `&jsToken=${encodeURIComponent(ctx.jsToken)}` +
+    `&shareid=${encodeURIComponent(ctx.shareid)}` +
+    `&uk=${encodeURIComponent(ctx.uk)}` +
+    `&sign=${encodeURIComponent(ctx.sign)}` +
+    `&timestamp=${encodeURIComponent(ctx.timestamp)}`;
+  let d = await tryFetchJson(`https://${ctx.finalHost}/api/download?${baseParams}`, ctx.apiHeaders);
+  if (d && d.dlink) return d.dlink;
+  d = await tryFetchJson(`https://${ctx.finalHost}/share/download?${baseParams}`, ctx.apiHeaders);
+  if (d && d.dlink) return d.dlink;
   return null;
 }
 
-// ── Resolve folders recursively (with shareid/uk — FIXED) ────────────────────
-async function resolveFiles(list, ctx, depth = 0) {
-  if (depth > 3) return list;
-  const allFiles = [];
-
+async function resolveFolders(list, ctx, depth = 0) {
+  if (depth > 3) return list; // safety cap
+  const out = [];
   for (const f of list) {
     if (isDir(f) && f.path) {
       const dirPath = encodeURIComponent(f.path);
-      const d = await tryFetch(
-        `https://${ctx.finalHost}/share/list?app_id=250528&shorturl=${ctx.surl}&root=0` +
-        `&dir=${dirPath}&page=1&num=100&order=time&desc=1` +
-        `&jsToken=${encodeURIComponent(ctx.jsToken)}&shareid=${ctx.shareid}&uk=${ctx.uk}`,
-        { ...ctx.apiHeaders, Referer: `https://${ctx.finalHost}/s/${ctx.surl}` }
+      const d = await tryFetchJson(
+        `https://${ctx.finalHost}/share/list?app_id=250528&shorturl=${ctx.surl}` +
+        `&root=0&dir=${dirPath}&page=1&num=100&order=time&desc=1` +
+        `&jsToken=${encodeURIComponent(ctx.jsToken)}` +
+        `&shareid=${encodeURIComponent(ctx.shareid)}` +
+        `&uk=${encodeURIComponent(ctx.uk)}`,
+        ctx.apiHeaders
       );
       if (d?.errno === 0 && d.list?.length) {
-        const nested = await resolveFiles(d.list, ctx, depth + 1);
-        allFiles.push(...nested);
+        out.push(...await resolveFolders(d.list, ctx, depth + 1));
       } else {
-        allFiles.push(f);
+        out.push(f);
       }
     } else {
-      allFiles.push(f);
+      out.push(f);
     }
   }
-
-  return allFiles;
+  return out;
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
 async function getTeraboxLinks(shareUrl) {
   const surl = extractSurl(shareUrl);
   const parsedUrl = new URL(shareUrl.startsWith('http') ? shareUrl : 'https://' + shareUrl);
   const originHost = parsedUrl.hostname;
-  const pageUrl = `https://${originHost}/s/${surl}`;
 
-  // Step 1 — collect session
-  const { cookies, html, finalUrl } = await fetchChain(pageUrl, {
-    'User-Agent': UA_DESKTOP,
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Upgrade-Insecure-Requests': '1',
-  });
+  // ── Step 1: open share page → collect session cookies + jsToken
+  const candidates = [originHost, 'www.1024tera.com', '1024terabox.com', 'www.terabox.com', 'terabox.app'];
+  let html = '', cookies = '', finalUrl = '', jsToken = '';
+
+  for (const host of candidates) {
+    try {
+      const r = await fetchChain(`https://${host}/s/${surl}`, {
+        'User-Agent': UA_DESKTOP,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Upgrade-Insecure-Requests': '1',
+      });
+      if (r.html.length > 0) {
+        html = r.html; cookies = r.cookies; finalUrl = r.finalUrl;
+        jsToken = extractJsToken(html);
+        if (jsToken) break;
+      }
+    } catch { /* try next mirror */ }
+  }
+
+  if (!jsToken) {
+    throw new Error(
+      `Could not extract jsToken. html length: ${html.length}. ` +
+      'Site may have updated or share token is invalid.'
+    );
+  }
 
   const finalHost = new URL(finalUrl).hostname;
-  const jsToken = extractJsToken(html);
-
   const apiHeaders = {
     'User-Agent': UA_DESKTOP,
-    Accept: 'application/json, text/plain, */*',
+    'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
     Referer: finalUrl,
     Cookie: cookies,
     'X-Requested-With': 'XMLHttpRequest',
   };
 
-  // Step 2 — shorturlinfo gives shareid/uk/sign/timestamp + root list
-  const info = await tryFetch(
-    `https://${finalHost}/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1&jsToken=${encodeURIComponent(jsToken)}`,
+  // ── Step 2: /api/shorturlinfo → shareid/uk/sign/timestamp + flat list
+  const info = await tryFetchJson(
+    `https://${finalHost}/api/shorturlinfo?app_id=250528&shorturl=${surl}` +
+    `&root=1&jsToken=${encodeURIComponent(jsToken)}`,
     { ...apiHeaders, Referer: `https://${finalHost}/s/${surl}` }
   );
 
   if (!info || info.errno !== 0) {
     throw new Error(
-      `TeraBox shorturlinfo failed: errno=${info?.errno} | ` +
+      `TeraBox error ${info?.errno || 'unknown'}: ${info?.errmsg || 'no data'} | ` +
       `jsToken: ${jsToken ? 'YES(' + jsToken.slice(0, 10) + '...)' : 'NO'} | ` +
       `cookies: ${cookies ? cookies.slice(0, 50) + '...' : 'none'}`
     );
@@ -216,21 +243,20 @@ async function getTeraboxLinks(shareUrl) {
     timestamp: info.timestamp || '',
   };
 
-  // Step 3 — resolve folders recursively
-  const resolved = await resolveFiles(info.list || [], ctx);
+  // ── Step 3: recursively resolve nested folders
+  const resolved = await resolveFolders(info.list || [], ctx);
 
-  // Step 4 — attach dlinks to every file
-  const withDlinks = [];
+  // ── Step 4: attach signed dlink to each file
+  const files = [];
   for (const f of resolved) {
     const item = { ...f };
-    if (!isDir(f)) item.dlink = item.dlink || (await getDlink(f, ctx));
-    withDlinks.push(item);
+    if (!isDir(f)) item.dlink = await getDlink(f, ctx);
+    files.push(item);
   }
 
-  return formatResult({ ...info, list: withDlinks }, surl);
+  return formatResult({ ...info, list: files }, surl);
 }
 
-// ── Format final output ───────────────────────────────────────────────────────
 function formatResult(data, surl) {
   const list = data.list || [];
   const files = list.map((f) => ({
@@ -262,7 +288,6 @@ function formatResult(data, surl) {
   };
 }
 
-// ── Utility ───────────────────────────────────────────────────────────────────
 function formatBytes(bytes) {
   if (!bytes) return '0 B';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
