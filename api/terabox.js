@@ -9,7 +9,7 @@
  */
 
 // ─── Constants & Endpoints ──────────────────────────────────────────────
-const BASE_URL = "https://flowvideoplayer.cc";
+const BASE_URL = "https://flowvideoplayer.com";
 const API_URL = "https://flowvideoplayer.com/telegram/bot/search/video";
 
 // ─── Helper function to find link in dynamic JSON ───────────────────────
