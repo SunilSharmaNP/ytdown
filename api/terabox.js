@@ -1,4 +1,4 @@
-// api/terabox.js — v4: folder resolution + direct dlink extraction
+// api/terabox.js — v5: fixed jsToken extraction + isdir normalization + dlink via /api/download
 
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 const UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36';
@@ -82,22 +82,17 @@ async function fetchChain(startUrl, baseHeaders) {
   return { cookies: objToStr(cookies), cookieObj: cookies, html, finalUrl };
 }
 
-// ── Extract jsToken + bdstoken from HTML ──────────────────────────────────────
-function extractTokens(html) {
-  const jsTokenPatterns = [
-    /window\.jsToken\s*=\s*["']?([A-Za-z0-9%_+=\/-]{16,})/i,
-    /"jsToken"\s*:\s*"([A-Za-z0-9%_+=\/-]{16,})"/i,
-    /jsToken\s*=\s*["']([A-Za-z0-9%_+=\/-]{16,})["']/i,
-    /["']token["']\s*:\s*["']([A-Za-z0-9%_+=\/-]{32,})["']/i,
-  ];
-  let jsToken = '';
-  for (const re of jsTokenPatterns) {
-    const m = html.match(re);
-    if (m) { jsToken = decodeURIComponent(m[1]); break; }
-  }
-  const bdstokenMatch = html.match(/bdstoken["'\s:=]+([a-zA-Z0-9]{16,})/);
-  const bdstoken = bdstokenMatch ? bdstokenMatch[1] : '';
-  return { jsToken, bdstoken };
+// ── Extract jsToken — FIXED (Bug #1) ─────────────────────────────────────────
+// Real token is injected as:
+//   eval(decodeURIComponent(`function%20fn%28a%29%7Bwindow.jsToken%20%3D%20a%7D%3Bfn%28%22<TOKEN>%22%29`))
+function extractJsToken(html) {
+  const m1 = html.match(/fn%28%22([A-Za-z0-9%_+=\/-]{16,})%22%29/);
+  if (m1) return decodeURIComponent(m1[1]);
+  const m2 = html.match(/fn\(["']([A-Za-z0-9%_+=\/-]{16,})["']\)/);
+  if (m2) return m2[1];
+  const m3 = html.match(/window\.jsToken\s*=\s*["']?([A-Za-z0-9%_+=\/-]{16,})/i);
+  if (m3) return decodeURIComponent(m3[1]);
+  return '';
 }
 
 // ── Safe JSON fetch ───────────────────────────────────────────────────────────
@@ -111,37 +106,55 @@ async function tryFetch(url, headers) {
   } catch { return null; }
 }
 
-// ── Resolve folders recursively ───────────────────────────────────────────────
-async function resolveFiles(list, surl, apiHeaders, jsToken, host, depth = 0) {
-  if (depth > 3) return list; // max 3 levels deep
+// ── is_dir normalization — FIXED (Bug #2) ────────────────────────────────────
+// TeraBox returns isdir as STRING "0"/"1", NOT boolean. Old code's !!f.isdir
+// treated "0" (a file) as truthy → every file was misread as a folder.
+function isDir(f) {
+  return f.isdir === '1' || f.isdir === 1 || f.isdir === true;
+}
+
+// ── Get dlink for a file — NEW (Bug #3) ──────────────────────────────────────
+// list items don't carry dlink; call /api/download with the file's fs_id.
+async function getDlink(f, ctx) {
+  const { finalHost, apiHeaders, surl, jsToken, shareid, uk, sign, timestamp } = ctx;
+  const fidlist = encodeURIComponent(JSON.stringify([String(f.fs_id)]));
+  const base =
+    `https://${finalHost}/api/download?fidlist=${fidlist}&shorturl=${surl}` +
+    `&app_id=250528&jsToken=${encodeURIComponent(jsToken)}` +
+    `&shareid=${shareid}&uk=${uk}&sign=${encodeURIComponent(sign)}&timestamp=${timestamp}`;
+  const d = await tryFetch(base, { ...apiHeaders, Referer: `https://${finalHost}/s/${surl}` });
+  if (d && d.errno === 0 && d.dlink) return d.dlink;
+
+  // fallback endpoint
+  const base2 =
+    `https://${finalHost}/share/download?fidlist=${fidlist}&shorturl=${surl}` +
+    `&app_id=250528&jsToken=${encodeURIComponent(jsToken)}` +
+    `&shareid=${shareid}&uk=${uk}&sign=${encodeURIComponent(sign)}&timestamp=${timestamp}`;
+  const d2 = await tryFetch(base2, { ...apiHeaders, Referer: `https://${finalHost}/s/${surl}` });
+  if (d2 && d2.errno === 0 && d2.dlink) return d2.dlink;
+
+  return null;
+}
+
+// ── Resolve folders recursively (with shareid/uk — FIXED) ────────────────────
+async function resolveFiles(list, ctx, depth = 0) {
+  if (depth > 3) return list;
   const allFiles = [];
 
   for (const f of list) {
-    if (f.isdir && f.path) {
+    if (isDir(f) && f.path) {
       const dirPath = encodeURIComponent(f.path);
       const d = await tryFetch(
-        `https://${host}/share/list?app_id=250528&shorturl=${surl}&root=0` +
+        `https://${ctx.finalHost}/share/list?app_id=250528&shorturl=${ctx.surl}&root=0` +
         `&dir=${dirPath}&page=1&num=100&order=time&desc=1` +
-        `&jsToken=${encodeURIComponent(jsToken)}`,
-        apiHeaders
+        `&jsToken=${encodeURIComponent(ctx.jsToken)}&shareid=${ctx.shareid}&uk=${ctx.uk}`,
+        { ...ctx.apiHeaders, Referer: `https://${ctx.finalHost}/s/${ctx.surl}` }
       );
       if (d?.errno === 0 && d.list?.length) {
-        const nested = await resolveFiles(d.list, surl, apiHeaders, jsToken, host, depth + 1);
+        const nested = await resolveFiles(d.list, ctx, depth + 1);
         allFiles.push(...nested);
       } else {
-        // path nahi mila, fs_id se try karo
-        const d2 = await tryFetch(
-          `https://${host}/share/list?app_id=250528&shorturl=${surl}&root=0` +
-          `&fid=${f.fs_id}&page=1&num=100&order=time&desc=1` +
-          `&jsToken=${encodeURIComponent(jsToken)}`,
-          apiHeaders
-        );
-        if (d2?.errno === 0 && d2.list?.length) {
-          const nested2 = await resolveFiles(d2.list, surl, apiHeaders, jsToken, host, depth + 1);
-          allFiles.push(...nested2);
-        } else {
-          allFiles.push(f); // as-is
-        }
+        allFiles.push(f);
       }
     } else {
       allFiles.push(f);
@@ -167,7 +180,7 @@ async function getTeraboxLinks(shareUrl) {
   });
 
   const finalHost = new URL(finalUrl).hostname;
-  const { jsToken, bdstoken } = extractTokens(html);
+  const jsToken = extractJsToken(html);
 
   const apiHeaders = {
     'User-Agent': UA_DESKTOP,
@@ -178,56 +191,43 @@ async function getTeraboxLinks(shareUrl) {
     'X-Requested-With': 'XMLHttpRequest',
   };
 
-  const jtEncoded = encodeURIComponent(jsToken);
-  const hosts = [...new Set([finalHost, originHost, 'www.terabox.com'])];
-  let lastData = null;
+  // Step 2 — shorturlinfo gives shareid/uk/sign/timestamp + root list
+  const info = await tryFetch(
+    `https://${finalHost}/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1&jsToken=${encodeURIComponent(jsToken)}`,
+    { ...apiHeaders, Referer: `https://${finalHost}/s/${surl}` }
+  );
 
-  for (const h of hosts) {
-    // Endpoint A: share/list
-    let d = await tryFetch(
-      `https://${h}/share/list?app_id=250528&shorturl=${surl}&root=1` +
-      `&page=1&num=100&order=time&desc=1&jsToken=${jtEncoded}&bdstoken=${bdstoken}`,
-      { ...apiHeaders, Referer: `https://${h}/s/${surl}` }
-    );
-    if (d?.errno === 0) {
-      const resolved = await resolveFiles(d.list || [], surl, apiHeaders, jsToken, h);
-      return formatResult({ ...d, list: resolved }, surl);
-    }
-    if (d) lastData = d;
-
-    // Endpoint B: shorturlinfo
-    d = await tryFetch(
-      `https://${h}/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1&jsToken=${jtEncoded}`,
-      { ...apiHeaders, Referer: `https://${h}/s/${surl}` }
-    );
-    if (d?.errno === 0) {
-      const resolved = await resolveFiles(d.list || [], surl, apiHeaders, jsToken, h);
-      return formatResult({ ...d, list: resolved }, surl);
-    }
-    if (d) lastData = d;
-
-    // Endpoint C: mobile UA
-    d = await tryFetch(
-      `https://${h}/share/list?app_id=250528&shorturl=${surl}&root=1` +
-      `&page=1&num=100&order=time&desc=1&jsToken=${jtEncoded}`,
-      { ...apiHeaders, 'User-Agent': UA_MOBILE, Referer: `https://${h}/s/${surl}` }
-    );
-    if (d?.errno === 0) {
-      const resolved = await resolveFiles(d.list || [], surl, apiHeaders, jsToken, h);
-      return formatResult({ ...d, list: resolved }, surl);
-    }
-    if (d) lastData = d;
-  }
-
-  if (lastData) {
+  if (!info || info.errno !== 0) {
     throw new Error(
-      `TeraBox error ${lastData.errno}: ${lastData.errmsg || 'Unknown'} | ` +
+      `TeraBox shorturlinfo failed: errno=${info?.errno} | ` +
       `jsToken: ${jsToken ? 'YES(' + jsToken.slice(0, 10) + '...)' : 'NO'} | ` +
       `cookies: ${cookies ? cookies.slice(0, 50) + '...' : 'none'}`
     );
   }
 
-  throw new Error('All endpoints failed — no JSON response from TeraBox');
+  const ctx = {
+    finalHost,
+    apiHeaders,
+    surl,
+    jsToken,
+    shareid: info.shareid || '',
+    uk: info.uk || '',
+    sign: info.sign || '',
+    timestamp: info.timestamp || '',
+  };
+
+  // Step 3 — resolve folders recursively
+  const resolved = await resolveFiles(info.list || [], ctx);
+
+  // Step 4 — attach dlinks to every file
+  const withDlinks = [];
+  for (const f of resolved) {
+    const item = { ...f };
+    if (!isDir(f)) item.dlink = item.dlink || (await getDlink(f, ctx));
+    withDlinks.push(item);
+  }
+
+  return formatResult({ ...info, list: withDlinks }, surl);
 }
 
 // ── Format final output ───────────────────────────────────────────────────────
@@ -237,7 +237,7 @@ function formatResult(data, surl) {
     filename: f.server_filename,
     size: formatBytes(f.size),
     size_bytes: f.size,
-    is_dir: !!f.isdir,
+    is_dir: isDir(f),
     fs_id: String(f.fs_id),
     dlink: f.dlink || null,
     thumbnail: f.thumbs?.url3 || null,
