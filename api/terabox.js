@@ -68,7 +68,8 @@ module.exports = async function handler(req, res) {
   if (!url) return res.status(400).json({ status: false, code: 400, message: 'URL required' });
 
   try {
-    const data = await getTeraboxLinks(url.trim(), { resolver });
+    const clientCookie = getClientTeraBoxCookie(req);
+    const data = await getTeraboxLinks(url.trim(), { resolver, cookie: clientCookie });
     const anyDlink = (data.files || []).some(f => f.dlink);
     return res.status(200).json({
       status: true,
@@ -80,6 +81,8 @@ module.exports = async function handler(req, res) {
       total_files: data.total_files, files: data.files, download_links: data.download_links,
       signed: data.signed,
       verify_v2_required: !anyDlink,
+      download_ready: anyDlink,
+      download_requires_cookie: !anyDlink,
       // Mirror Flow Video Player's response shape (file_name, file_size, ...)
       message_human: anyDlink
         ? `Resolved ${data.total_files} file(s) with direct download links`
@@ -89,6 +92,25 @@ module.exports = async function handler(req, res) {
     return res.status(500).json({ status: false, success: false, code: 500, message: err.message });
   }
 };
+
+// A TeraBox share page normally gives metadata without authentication, but
+// /share/download now requires the caller's browser session (the `ndus`
+// cookie). Never use the app's own Cookie header here: it belongs to the
+// Vercel request and may contain unrelated application cookies. Callers that
+// have a TeraBox browser session can pass it explicitly in X-TeraBox-Cookie,
+// or pass only the token in X-TeraBox-Ndus.
+function getClientTeraBoxCookie(req) {
+  const headerCookie = req.headers?.['x-terabox-cookie'];
+  const headerNdus = req.headers?.['x-terabox-ndus'];
+  const body = req.method === 'POST' && req.body ? req.body : {};
+  const query = req.query || {};
+  const rawCookie = headerCookie || body.terabox_cookie || query.terabox_cookie || '';
+  const ndus = headerNdus || body.ndus || query.ndus || '';
+
+  const cookie = typeof rawCookie === 'string' ? rawCookie.trim() : '';
+  if (cookie) return ndus ? `${cookie}; ndus=${String(ndus).trim()}` : cookie;
+  return ndus ? `ndus=${String(ndus).trim()}` : '';
+}
 
 // ─── URL parsing ──────────────────────────────────────────────────────────
 function extractSurl(rawUrl) {
@@ -111,6 +133,13 @@ function cookieObjFromHeader(raw) {
   return out;
 }
 function cookieStr(obj) { return Object.entries(obj).map(([k,v]) => `${k}=${v}`).join('; '); }
+function mergeCookies(...headers) {
+  const merged = {};
+  for (const header of headers) {
+    Object.assign(merged, cookieObjFromHeader(header));
+  }
+  return cookieStr(merged);
+}
 
 async function fetchChain(startUrl, baseHeaders) {
   let url = startUrl, cookies = {}, html = '', finalUrl = startUrl;
@@ -167,6 +196,16 @@ async function tryJson(url, headers) {
   } catch { return null; }
 }
 
+async function tryJsonRequest(url, options) {
+  try {
+    const res = await fetch(url, options);
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('json')) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
 // v6/v7 BUG FIX #2 — full signed-token quartet; v7 expands the endpoint pool to 6.
 async function getDlink(f, ctx) {
   if (f.dlink) return f.dlink;
@@ -194,22 +233,67 @@ async function getDlink(f, ctx) {
     if (d && (d.dlink || d.download_url)) return d.dlink || d.download_url;
   }
 
-  // POST attempts (mobile client style)
+  // The current web API also accepts form-encoded requests. The old code sent
+  // JSON here, which is silently rejected by some TeraBox mirrors.
   for (const path of ['/share/download', '/api/download']) {
-    try {
-      const r = await fetch(`https://${ctx.finalHost}${path}?app_id=250528&channel=chunlei&clienttype=0&sign=${encodeURIComponent(ctx.sign)}&timestamp=${encodeURIComponent(ctx.timestamp)}&jsToken=${encodeURIComponent(ctx.jsToken)}`, {
+    const form = new URLSearchParams({
+      app_id: '250528',
+      channel: 'chunlei',
+      clienttype: '0',
+      web: '1',
+      sign: String(ctx.sign),
+      timestamp: String(ctx.timestamp),
+      jsToken: String(ctx.jsToken),
+      fid_list: JSON.stringify([String(f.fs_id)]),
+      primaryid: String(ctx.shareid),
+      shareid: String(ctx.shareid),
+      shorturl: String(ctx.surl),
+      uk: String(ctx.uk),
+      vuk: String(ctx.uk),
+    });
+    const d = await tryJsonRequest(`https://${ctx.finalHost}${path}`, {
+      method: 'POST',
+      headers: { ...ctx.apiHeaders, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+    });
+    if (d && (d.dlink || d.download_url)) return d.dlink || d.download_url;
+  }
+
+  // filemetas is the fallback used by the official web client and by the
+  // current terabox-api package. It needs the same ndus session when the
+  // share/download gate is active, but is worth trying before giving up.
+  const meta = await tryJsonRequest(`https://${ctx.finalHost}/api/filemetas`, {
+    method: 'POST',
+    headers: { ...ctx.apiHeaders, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      dlink: '1',
+      origin: 'dlna',
+      target: JSON.stringify([{
+        fs_id: String(f.fs_id),
+        path: f.path || '',
+        server_filename: f.server_filename || '',
+      }]),
+    }).toString(),
+  });
+  const metaDlink = meta?.dlink || meta?.download_url || meta?.data?.dlink ||
+    meta?.data?.download_url || meta?.data?.list?.[0]?.dlink;
+  if (metaDlink) return metaDlink;
+
+  // POST attempts (mobile client style) kept as a final compatibility
+  // fallback for older mirrors.
+  for (const path of ['/share/download', '/api/download']) {
+    const d = await tryJsonRequest(
+      `https://${ctx.finalHost}${path}?app_id=250528&channel=chunlei&clienttype=0&sign=${encodeURIComponent(ctx.sign)}&timestamp=${encodeURIComponent(ctx.timestamp)}&jsToken=${encodeURIComponent(ctx.jsToken)}`,
+      {
         method: 'POST',
         headers: { ...ctx.apiHeaders, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fid_list: [String(f.fs_id)], primaryid: ctx.shareid, uk: ctx.uk,
           shareid: ctx.shareid, shorturl: ctx.surl, vuk: ctx.uk
         })
-      });
-      if (r.ok) {
-        const d = await r.json();
-        if (d && (d.dlink || d.download_url)) return d.dlink || d.download_url;
       }
-    } catch (_) {}
+    );
+    if (d && (d.dlink || d.download_url)) return d.dlink || d.download_url;
   }
 
   // Resolver-chain fallback (third-party service already has ndus)
@@ -271,7 +355,7 @@ async function getTeraboxLinks(shareUrl, opts = {}) {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Upgrade-Insecure-Requests': '1',
-      });
+      }, opts.cookie || '');
       if (r.html.length > 5000) {
         html = r.html; cookies = r.cookies; finalUrl = r.finalUrl;
         jsToken = extractJsToken(html);
@@ -287,7 +371,7 @@ async function getTeraboxLinks(shareUrl, opts = {}) {
     'User-Agent': UA_DESKTOP,
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
-    Referer: finalUrl, Cookie: cookies,
+    Referer: finalUrl, Cookie: mergeCookies(cookies, opts.cookie || ''),
     'X-Requested-With': 'XMLHttpRequest',
   };
 
@@ -305,7 +389,7 @@ async function getTeraboxLinks(shareUrl, opts = {}) {
     shareid: info.shareid || '', uk: info.uk || '',
     sign: info.sign || '', timestamp: String(info.timestamp || ''),
     finalUrl,
-    resolver: opts.resolver || null
+    resolver: opts.resolver || null,
   };
 
   const resolved = await resolveFolders(info.list || [], ctx);
