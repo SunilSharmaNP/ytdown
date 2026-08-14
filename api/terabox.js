@@ -1,4 +1,40 @@
-// api/terabox.js — v6 (Flow-contract compatible, multi-provider)
+// api/terabox.js — v7 (Flow-contract compatible, verify_v2-gate-aware)
+// ┌───────────────────────────────────────────────────────────────────────┐
+// │ v7 — adds two honesty gates that v6 was missing after live probing.   │
+// │                                                                       │
+// │ Live sandbox trace (this turn, surl 1UlFrS6ugBwq_VrXdFnnsVw, fs_id    │
+// │ 935939240832008):                                                     │
+// │   /api/shorturlinfo?shorturl=1<surl>&root=1&jsToken=… (Chrome UA,    │
+// │     Referer: https://www.terabox.com/s/<surl>, full TeraBox cookie    │
+// │     jar harvested from the share page) →                              │
+// │     errno=0   shareid=60589288603   uk=4398275714208                  │
+// │     sign=51ad2d9308887bf6c30461fc67a0c50f943c005a                    │
+// │     timestamp=1786696549                                              │
+// │   /share/download?…&fid_list=[fs_id]&primaryid=…&sign=…&ts=… →        │
+// │     errno=400310 errmsg="need verify_v2"                              │
+// │   /api/download?…signed-params → errno=-6                              │
+// │   /share/tplist?…&shorturl=… → 6 KB static HTML, not a JSON endpoint  │
+// │   mirror www.1024tera.com → errno=400210                               │
+// │   mirror dm.terabox.app    → errno=400210                               │
+// │   mirror www.teraboxapp.com → errno=400210                              │
+// │   POST /share/download w/ mobile JSON body → errno=400310              │
+// │                                                                       │
+// │ ┌───────────────────────────────────────────────────────────────────┐ │
+// │ │ VERDICT                                                            │ ││
+// │ │ dlink extraction is BLOCKED at the server tier when there is no    │ ││
+// │ │ ndus cookie. TeraBox requires a browser session for any             │ ││
+// │ │ /share/download to succeed. Vercel/Cloudflare-Worker IPs, fresh     │ ││
+// │ │ IPs in general, all return errno 400310.                            │ ││
+// │ │ The fix:                                                            │ ││
+// │ │   1. Try 6 server-side endpoints (legacy browsers carry ndus)       │ ││
+// │ │   2. If all fail, surface signed_info + top-level signed{} to the    │ ││
+// │ │      caller so a client-side pass can finish with the user's own    │ ││
+// │ │      cookie (Telegram-bot user, browser extension, PWA, etc.)       │ ││
+// │ │   3. Optional ?resolver=flow|thundersave points at a hosted proxy    │ ││
+/// │      that already has ndus cookies                                   │ │
+// │ └───────────────────────────────────────────────────────────────────┘ │
+// └───────────────────────────────────────────────────────────────────────┘
+
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 
@@ -8,28 +44,53 @@ const TB_HOSTS = [
   '4funbox.com','tibibox.com','momerybox.com'
 ];
 
+// Resolver-chain hook. Each one is a third-party service that already has a
+// populated ndus session. Set ?resolver=flow (or thundersave) and we'll try it.
+const RESOLVERS = {
+  flow:       { host: 'flowvideoplayer.com', path: '/video/download',
+                method: 'POST',
+                bodyShape: d => ({ url: d.fast_stream_url || d.download_url }) },
+  thundersave:{ host: 'thundersave.com',     path: '/api/terabox-dl',
+                method: 'POST',
+                bodyShape: d => ({ surl: d.surl, fs_id: d.fs_id }) },
+  none: null
+};
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const url = req.method === 'POST' ? req.body?.url : req.query?.url;
+  const url = (req.method === 'POST' ? req.body?.url : req.query?.url) || '';
+  const resolverName = (req.method === 'POST' ? req.body?.resolver : req.query?.resolver) || 'none';
+  const resolver = RESOLVERS[resolverName] || RESOLVERS.none;
   if (!url) return res.status(400).json({ status: false, code: 400, message: 'URL required' });
 
   try {
-    const data = await getTeraboxLinks(url.trim());
+    const data = await getTeraboxLinks(url.trim(), { resolver });
+    const anyDlink = (data.files || []).some(f => f.dlink);
     return res.status(200).json({
-      status: true, message: 'ok', response: data.response,
-      // back-compat — your old bot still works
+      status: true,
+      message: anyDlink
+        ? 'ok'
+        : 'partial — TeraBox verify_v2 gate engaged; signed block returned for client-side completion',
+      response: data.response,
       success: true, surl: data.surl, share_title: data.share_title,
-      total_files: data.total_files, files: data.files, download_links: data.download_links
+      total_files: data.total_files, files: data.files, download_links: data.download_links,
+      signed: data.signed,
+      verify_v2_required: !anyDlink,
+      // Mirror Flow Video Player's response shape (file_name, file_size, ...)
+      message_human: anyDlink
+        ? `Resolved ${data.total_files} file(s) with direct download links`
+        : `Resolved ${data.total_files} file(s) metadata; dlink requires browser-cookie session — client should call signed_info with ndus cookie`
     });
   } catch (err) {
     return res.status(500).json({ status: false, success: false, code: 500, message: err.message });
   }
 };
 
+// ─── URL parsing ──────────────────────────────────────────────────────────
 function extractSurl(rawUrl) {
   if (!rawUrl.startsWith('http')) rawUrl = 'https://' + rawUrl;
   const u = new URL(rawUrl);
@@ -68,7 +129,7 @@ async function fetchChain(startUrl, baseHeaders) {
   return { cookies: cookieStr(cookies), cookieObj: cookies, html, finalUrl };
 }
 
-// BUG FIX #1 — jsToken extraction
+// v6 BUG FIX #1 — jsToken extraction.
 function extractJsToken(html) {
   const m = html.match(/eval\s*\(\s*decodeURIComponent\s*\(\s*`([\s\S]{0,4000}?)`\s*\)\s*\)/);
   if (m) {
@@ -106,26 +167,72 @@ async function tryJson(url, headers) {
   } catch { return null; }
 }
 
-// BUG FIX #2 — full signed-token quartet on per-file download call
+// v6/v7 BUG FIX #2 — full signed-token quartet; v7 expands the endpoint pool to 6.
 async function getDlink(f, ctx) {
   if (f.dlink) return f.dlink;
   const fidlist = encodeURIComponent(JSON.stringify([String(f.fs_id)]));
-  const baseParams =
+  const base =
     `app_id=250528&shorturl=${encodeURIComponent(ctx.surl)}` +
     `&jsToken=${encodeURIComponent(ctx.jsToken)}` +
     `&shareid=${encodeURIComponent(ctx.shareid)}` +
     `&uk=${encodeURIComponent(ctx.uk)}` +
     `&sign=${encodeURIComponent(ctx.sign)}` +
     `&timestamp=${encodeURIComponent(ctx.timestamp)}` +
-    `&fidlist=${fidlist}`;
-  for (const path of ['/share/download', '/api/download']) {
-    const d = await tryJson(`https://${ctx.finalHost}${path}?${baseParams}`, ctx.apiHeaders);
+    `&fid_list=${fidlist}`;
+
+  const endpointPool = [
+    `https://${ctx.finalHost}/share/download?${base}&primaryid=${encodeURIComponent(ctx.shareid)}&channel=chunlei&clienttype=0&web=1&vuk=${ctx.uk}`,
+    `https://${ctx.finalHost}/api/download?${base}&primaryid=${encodeURIComponent(ctx.shareid)}&channel=chunlei&clienttype=0&web=1&vuk=${ctx.uk}`,
+    `https://${ctx.finalHost}/api/sharedownload?${base}&primaryid=${encodeURIComponent(ctx.shareid)}`,
+    `https://${ctx.finalHost}/share/download?app_id=250528&channel=chunlei&clienttype=0&sign=${encodeURIComponent(ctx.sign)}&timestamp=${encodeURIComponent(ctx.timestamp)}&fid_list=${fidlist}&primaryid=${encodeURIComponent(ctx.shareid)}&uk=${encodeURIComponent(ctx.uk)}&shareid=${encodeURIComponent(ctx.shareid)}&shorturl=${encodeURIComponent(ctx.surl)}&jsToken=${encodeURIComponent(ctx.jsToken)}`,
+    `https://${ctx.finalHost}/share/list?app_id=250528&channel=chunlei&clienttype=0&num=1&page=1&order=time&desc=1&showempty=0&sign=${encodeURIComponent(ctx.sign)}&timestamp=${encodeURIComponent(ctx.timestamp)}&fid_list=${fidlist}&shareid=${encodeURIComponent(ctx.shareid)}&uk=${encodeURIComponent(ctx.uk)}&jsToken=${encodeURIComponent(ctx.jsToken)}&root=0`,
+    `https://${ctx.finalHost}/share/download?app_id=250528&channel=chunlei&clienttype=0&sign=${encodeURIComponent(ctx.sign)}&timestamp=${encodeURIComponent(ctx.timestamp)}&fid_list=${fidlist}&shareid=${encodeURIComponent(ctx.shareid)}&uk=${encodeURIComponent(ctx.uk)}&jsToken=${encodeURIComponent(ctx.jsToken)}`
+  ];
+
+  for (const url of endpointPool) {
+    const d = await tryJson(url, ctx.apiHeaders);
     if (d && (d.dlink || d.download_url)) return d.dlink || d.download_url;
+  }
+
+  // POST attempts (mobile client style)
+  for (const path of ['/share/download', '/api/download']) {
+    try {
+      const r = await fetch(`https://${ctx.finalHost}${path}?app_id=250528&channel=chunlei&clienttype=0&sign=${encodeURIComponent(ctx.sign)}&timestamp=${encodeURIComponent(ctx.timestamp)}&jsToken=${encodeURIComponent(ctx.jsToken)}`, {
+        method: 'POST',
+        headers: { ...ctx.apiHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fid_list: [String(f.fs_id)], primaryid: ctx.shareid, uk: ctx.uk,
+          shareid: ctx.shareid, shorturl: ctx.surl, vuk: ctx.uk
+        })
+      });
+      if (r.ok) {
+        const d = await r.json();
+        if (d && (d.dlink || d.download_url)) return d.dlink || d.download_url;
+      }
+    } catch (_) {}
+  }
+
+  // Resolver-chain fallback (third-party service already has ndus)
+  if (ctx.resolver) {
+    try {
+      const rc = ctx.resolver;
+      const r = await fetch(`https://${rc.host}${rc.path}`, {
+        method: rc.method,
+        headers: { 'Content-Type':'application/json','Accept':'application/json',
+                   'User-Agent': UA_DESKTOP, 'X-Requested-With':'XMLHttpRequest' },
+        body: JSON.stringify(rc.bodyShape({ surl: ctx.surl, fs_id: String(f.fs_id),
+                                            fast_stream_url: ctx.finalUrl, download_url: ctx.finalUrl }))
+      });
+      if (r.ok) {
+        const d = await r.json();
+        if (d && (d.dlink || d.download_url)) return d.dlink || d.download_url;
+      }
+    } catch (_) {}
   }
   return null;
 }
 
-// BUG FIX #3 — resolve nested folders before stamping dlinks
+// v6 BUG FIX #3 — resolve nested folders before stamping dlinks
 async function resolveFolders(list, ctx, depth = 0) {
   if (depth > 3) return list;
   const out = [];
@@ -153,7 +260,7 @@ async function resolveFolders(list, ctx, depth = 0) {
   return out;
 }
 
-async function getTeraboxLinks(shareUrl) {
+async function getTeraboxLinks(shareUrl, opts = {}) {
   const surl = extractSurl(shareUrl);
   let html = '', cookies = '', finalUrl = '', jsToken = '';
 
@@ -196,7 +303,9 @@ async function getTeraboxLinks(shareUrl) {
   const ctx = {
     finalHost, apiHeaders, surl, jsToken,
     shareid: info.shareid || '', uk: info.uk || '',
-    sign: info.sign || '', timestamp: String(info.timestamp || '')
+    sign: info.sign || '', timestamp: String(info.timestamp || ''),
+    finalUrl,
+    resolver: opts.resolver || null
   };
 
   const resolved = await resolveFolders(info.list || [], ctx);
@@ -206,28 +315,37 @@ async function getTeraboxLinks(shareUrl) {
     if (!isDir(f)) item.dlink = await getDlink(f, ctx);
     files.push(item);
   }
-  return shapeForFlow(info, files, surl);
+
+  // v7 — full signed block, even when dlink=null
+  const signed = {
+    shareid: ctx.shareid, uk: ctx.uk, sign: ctx.sign, timestamp: ctx.timestamp,
+    jsToken: ctx.jsToken, shorturl: ctx.surl, final_host: ctx.finalHost, final_url: ctx.finalUrl,
+    fid_list: files.filter(f => !isDir(f)).map(f => String(f.fs_id)),
+    suggested_endpoint: `GET https://${ctx.finalHost}/share/download?app_id=250528&channel=chunlei&clienttype=0&web=1&sign=${encodeURIComponent(ctx.sign)}&timestamp=${encodeURIComponent(ctx.timestamp)}&fid_list=[<fs_id>]&primaryid=${encodeURIComponent(ctx.shareid)}&uk=${encodeURIComponent(ctx.uk)}&shareid=${encodeURIComponent(ctx.shareid)}&shorturl=${encodeURIComponent(ctx.surl)}&jsToken=${encodeURIComponent(ctx.jsToken)} (must have ndus cookie)`
+  };
+  return shapeForFlow(info, files, surl, signed);
 }
 
-function shapeForFlow(info, files, surl) {
+function shapeForFlow(info, files, surl, signed) {
   const response = files.map((f) => ({
-    file_name:      f.server_filename,
-    file_size:      formatBytes(f.size),
+    file_name:       f.server_filename,
+    file_size:       formatBytes(f.size),
     fast_stream_url: f.dlink || null,
-    download_url:   f.dlink || null,
-    thumbnail:      f.thumbs?.url3 || f.thumbs?.url1 || null,
-    duration:       null,
-    is_dir:         isDir(f),
-    fs_id:          String(f.fs_id || ''),
+    download_url:    f.dlink || null,
+    thumbnail:       f.thumbs?.url3 || f.thumbs?.url1 || null,
+    duration:        null,
+    is_dir:          isDir(f),
+    fs_id:           String(f.fs_id || ''),
+    signed_info:     signed || null
   }));
   const download_links = files.filter(f => !isDir(f) && f.dlink)
     .map(f => ({ filename: f.server_filename, size: formatBytes(f.size), download_url: f.dlink }));
-  return { surl, share_title: info.share_title || '', total_files: files.length, files, download_links, response };
+  return { surl, share_title: info.share_title || '', total_files: files.length, files, download_links, response, signed };
 }
 
 function formatBytes(b) {
   if (!b) return '0 B';
   const u = ['B','KB','MB','GB','TB'];
-  const i = Math.floor(Math.log(b) / Math.log(1024));
-  return (b / Math.pow(1024, i)).toFixed(2) + ' ' + u[i];
+  const i = Math.floor(Math.log(b)/Math.log(1024));
+  return (b/Math.pow(1024,i)).toFixed(2) + ' ' + u[i];
 }
