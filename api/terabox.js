@@ -3,7 +3,7 @@
  * Version: Ultimate Security Bypass (Origin & Referer Fix)
  */
 
-const SITE_URL = "https://flowvideoplayer.cc";
+const SITE_URL = "https://flowvideoplayer.com";
 const API_URL = "https://flowvideoplayer.com/telegram/bot/search/video"; 
 
 function extractStreamUrl(obj) {
