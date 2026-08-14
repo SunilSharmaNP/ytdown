@@ -4,7 +4,7 @@
  */
 
 const BASE_URL = "https://flowvideoplayer.com";
-const API_URL = "https://flowvideoplayer.cc/telegram/bot/search/video"; 
+const API_URL = "https://flowvideoplayer.com/telegram/bot/search/video"; 
 
 function extractStreamUrl(obj) {
   if (!obj) return null;
