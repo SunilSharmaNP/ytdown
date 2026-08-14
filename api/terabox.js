@@ -1,4 +1,7 @@
-// api/terabox.js — Fixed: handles verify_v2 by extracting session cookies + jsToken
+// api/terabox.js — v3: domain-aware + full redirect chain + multi-endpoint
+
+const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+const UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36';
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -7,8 +10,7 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const url = req.method === 'POST' ? req.body?.url : req.query?.url;
-  if (!url)
-    return res.status(400).json({ success: false, error: 'URL required' });
+  if (!url) return res.status(400).json({ success: false, error: 'URL required' });
 
   try {
     const data = await getTeraboxLinks(url.trim());
@@ -18,7 +20,7 @@ module.exports = async function handler(req, res) {
   }
 };
 
-// ── Extract surl token ────────────────────────────────────────────────────────
+// ── Token extractor ───────────────────────────────────────────────────────────
 function extractSurl(rawUrl) {
   if (!rawUrl.startsWith('http')) rawUrl = 'https://' + rawUrl;
   const u = new URL(rawUrl);
@@ -29,72 +31,173 @@ function extractSurl(rawUrl) {
   throw new Error('Cannot extract share token from URL');
 }
 
-const BASE_HEADERS = {
-  'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9',
-};
+// ── Cookie helpers ────────────────────────────────────────────────────────────
+function parseCookiesToObj(raw) {
+  const obj = {};
+  if (!raw) return obj;
+  // set-cookie header can be multi-value
+  const arr = Array.isArray(raw) ? raw : [raw];
+  for (const chunk of arr) {
+    for (const part of chunk.split(/,(?=\s*[a-zA-Z_-]+=)/)) {
+      const [kv] = part.split(';');
+      const idx = kv.indexOf('=');
+      if (idx > 0) obj[kv.slice(0, idx).trim()] = kv.slice(idx + 1).trim();
+    }
+  }
+  return obj;
+}
 
-// ── Parse Set-Cookie header into a flat cookie string ────────────────────────
-function parseCookies(raw) {
-  if (!raw) return '';
-  const arr = Array.isArray(raw) ? raw : raw.split(/,(?=[^ ])/);
-  return arr.map((c) => c.split(';')[0].trim()).filter(Boolean).join('; ');
+function objToStr(obj) {
+  return Object.entries(obj).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+// ── Follow redirects manually, collect ALL cookies ───────────────────────────
+async function fetchChain(startUrl, baseHeaders) {
+  let currentUrl = startUrl;
+  let cookies = {};
+  let html = '';
+  let finalUrl = startUrl;
+
+  for (let i = 0; i < 6; i++) {
+    const res = await fetch(currentUrl, {
+      headers: { ...baseHeaders, Cookie: objToStr(cookies) },
+      redirect: 'manual',
+    });
+
+    const setCookie = res.headers.get('set-cookie');
+    if (setCookie) {
+      Object.assign(cookies, parseCookiesToObj(setCookie));
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      let loc = res.headers.get('location') || '';
+      if (!loc) break;
+      if (!loc.startsWith('http')) loc = new URL(loc, currentUrl).href;
+      currentUrl = loc;
+      continue;
+    }
+
+    html = await res.text();
+    finalUrl = currentUrl;
+    break;
+  }
+
+  return { cookies: objToStr(cookies), cookieObj: cookies, html, finalUrl };
+}
+
+// ── Extract tokens from HTML ──────────────────────────────────────────────────
+function extractTokens(html) {
+  const jsTokenPatterns = [
+    /window\.jsToken\s*=\s*["']?([A-Za-z0-9%_+=\/-]{16,})/i,
+    /"jsToken"\s*:\s*"([A-Za-z0-9%_+=\/-]{16,})"/i,
+    /jsToken\s*=\s*["']([A-Za-z0-9%_+=\/-]{16,})["']/i,
+    /["']token["']\s*:\s*["']([A-Za-z0-9%_+=\/-]{32,})["']/i,
+  ];
+  let jsToken = '';
+  for (const re of jsTokenPatterns) {
+    const m = html.match(re);
+    if (m) { jsToken = decodeURIComponent(m[1]); break; }
+  }
+
+  const bdstokenMatch = html.match(/bdstoken["'\s:=]+([a-zA-Z0-9]{16,})/);
+  const bdstoken = bdstokenMatch ? bdstokenMatch[1] : '';
+
+  return { jsToken, bdstoken };
+}
+
+// ── Single fetch attempt ──────────────────────────────────────────────────────
+async function tryFetch(url, headers) {
+  try {
+    const res = await fetch(url, { headers });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('json')) return null;
+    return await res.json();
+  } catch { return null; }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function getTeraboxLinks(shareUrl) {
   const surl = extractSurl(shareUrl);
+  const parsedUrl = new URL(shareUrl.startsWith('http') ? shareUrl : 'https://' + shareUrl);
+  const originHost = parsedUrl.hostname; // e.g. teraboxapp.com
 
-  // ── Step 1: Visit the share page to collect session cookies + jsToken ──────
-  const sharePage = `https://www.terabox.com/s/${surl}`;
-  const pageRes = await fetch(sharePage, {
-    headers: BASE_HEADERS,
-    redirect: 'follow',
+  const pageUrl = `https://${originHost}/s/${surl}`;
+
+  // Step 1 — collect session via redirect chain
+  const { cookies, html, finalUrl } = await fetchChain(pageUrl, {
+    'User-Agent': UA_DESKTOP,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Upgrade-Insecure-Requests': '1',
   });
 
-  const cookieStr = parseCookies(pageRes.headers.get('set-cookie'));
-  const html = await pageRes.text();
-
-  // Extract jsToken (required for API calls)
-  const jsTokenMatch =
-    html.match(/window\.jsToken\s*=\s*["']?([A-Za-z0-9%_+=/-]{10,})/) ||
-    html.match(/jsToken["'\s]*[:=]["'\s]*([A-Za-z0-9%_+=/-]{10,})/);
-  const jsToken = jsTokenMatch ? decodeURIComponent(jsTokenMatch[1]) : '';
-
-  // Extract bdstoken (optional but helps)
-  const bdstokenMatch = html.match(/bdstoken["'\s:=]+([a-zA-Z0-9]{16,})/);
-  const bdstoken = bdstokenMatch ? bdstokenMatch[1] : '';
+  const finalHost = new URL(finalUrl).hostname;
+  const { jsToken, bdstoken } = extractTokens(html);
 
   const apiHeaders = {
-    'User-Agent': BASE_HEADERS['User-Agent'],
+    'User-Agent': UA_DESKTOP,
     Accept: 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
-    Referer: sharePage,
-    Cookie: cookieStr,
+    Referer: finalUrl,
+    Cookie: cookies,
+    'X-Requested-With': 'XMLHttpRequest',
   };
 
-  // ── Step 2: Use share/list endpoint (avoids verify_v2) ───────────────────
-  let data = await tryShareList(surl, jsToken, bdstoken, apiHeaders);
+  const mobileHeaders = {
+    ...apiHeaders,
+    'User-Agent': UA_MOBILE,
+    Referer: `https://${originHost}/s/${surl}`,
+  };
 
-  // ── Fallback: shorturlinfo with session cookies ───────────────────────────
-  if (!data) {
-    data = await tryShortUrlInfo(surl, jsToken, apiHeaders);
-  }
+  const jtEncoded = encodeURIComponent(jsToken);
+  const hosts = [...new Set([finalHost, originHost, 'www.terabox.com'])];
+  let lastData = null;
 
-  if (!data) throw new Error('All endpoints failed. TeraBox may have blocked this region.');
-
-  if (data.errno !== 0) {
-    throw new Error(
-      `TeraBox error ${data.errno}: ${data.errmsg || 'Link expired or private'}`
+  for (const h of hosts) {
+    // share/list
+    let d = await tryFetch(
+      `https://${h}/share/list?app_id=250528&shorturl=${surl}&root=1&page=1&num=20&order=time&desc=1&jsToken=${jtEncoded}&bdstoken=${bdstoken}`,
+      { ...apiHeaders, Referer: `https://${h}/s/${surl}` }
     );
+    if (d?.errno === 0) return formatResult(d, surl);
+    if (d) lastData = d;
+
+    // shorturlinfo
+    d = await tryFetch(
+      `https://${h}/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1&jsToken=${jtEncoded}`,
+      { ...apiHeaders, Referer: `https://${h}/s/${surl}` }
+    );
+    if (d?.errno === 0) return formatResult(d, surl);
+    if (d) lastData = d;
+
+    // mobile share/list
+    d = await tryFetch(
+      `https://${h}/share/list?app_id=250528&shorturl=${surl}&root=1&page=1&num=20&order=time&desc=1&jsToken=${jtEncoded}`,
+      mobileHeaders
+    );
+    if (d?.errno === 0) return formatResult(d, surl);
+    if (d) lastData = d;
   }
 
-  const list = data.list || data.records || [];
-  if (!list.length) throw new Error('No files found in this link');
+  // Report last known error
+  if (lastData) {
+    if (lastData.errno === 105) {
+      throw new Error(
+        `errno 105: TeraBox blocked this server IP (Vercel/AWS). ` +
+        `Debug — jsToken extracted: ${jsToken ? 'YES (' + jsToken.slice(0,12) + '...)' : 'NO'}, ` +
+        `cookies: ${cookies ? cookies.slice(0, 60) + '...' : 'none'}`
+      );
+    }
+    throw new Error(`TeraBox error ${lastData.errno}: ${lastData.errmsg || 'Unknown'}`);
+  }
 
+  throw new Error('All endpoints failed — TeraBox returned no JSON response');
+}
+
+// ── Format output ─────────────────────────────────────────────────────────────
+function formatResult(data, surl) {
+  const list = data.list || data.records || [];
   const files = list.map((f) => ({
     filename: f.server_filename,
     size: formatBytes(f.size),
@@ -105,62 +208,12 @@ async function getTeraboxLinks(shareUrl) {
     thumbnail: f.thumbs?.url3 || null,
     category: f.category,
   }));
-
   const download_links = files
     .filter((f) => !f.is_dir && f.dlink)
-    .map((f) => ({
-      filename: f.filename,
-      size: f.size,
-      download_url: f.dlink,
-    }));
-
-  return {
-    surl,
-    share_title: data.share_title || data.title || '',
-    total_files: files.length,
-    files,
-    download_links,
-  };
+    .map((f) => ({ filename: f.filename, size: f.size, download_url: f.dlink }));
+  return { surl, share_title: data.share_title || '', total_files: files.length, files, download_links };
 }
 
-// ── Endpoint A: share/list ────────────────────────────────────────────────────
-async function tryShareList(surl, jsToken, bdstoken, headers) {
-  try {
-    const url =
-      `https://www.terabox.com/share/list` +
-      `?app_id=250528&shorturl=${surl}&root=1` +
-      `&page=1&num=20&order=time&desc=1` +
-      `&jsToken=${encodeURIComponent(jsToken)}` +
-      `&bdstoken=${bdstoken}`;
-
-    const res = await fetch(url, { headers });
-    if (!res.ok) return null;
-    const json = await res.json();
-    // errno 0 or actual list = success; anything else fall through
-    if (json.errno === 400210) return null; // still needs verify, try next
-    return json;
-  } catch {
-    return null;
-  }
-}
-
-// ── Endpoint B: shorturlinfo (with session cookies now) ───────────────────────
-async function tryShortUrlInfo(surl, jsToken, headers) {
-  try {
-    const url =
-      `https://www.terabox.com/api/shorturlinfo` +
-      `?app_id=250528&shorturl=${surl}&root=1` +
-      `&jsToken=${encodeURIComponent(jsToken)}`;
-
-    const res = await fetch(url, { headers });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-// ── Utility ───────────────────────────────────────────────────────────────────
 function formatBytes(bytes) {
   if (!bytes) return '0 B';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
