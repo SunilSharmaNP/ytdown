@@ -1,4 +1,4 @@
-// api/terabox.js — v3: domain-aware + full redirect chain + multi-endpoint
+// api/terabox.js — v4: folder resolution + direct dlink extraction
 
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 const UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36';
@@ -20,7 +20,7 @@ module.exports = async function handler(req, res) {
   }
 };
 
-// ── Token extractor ───────────────────────────────────────────────────────────
+// ── Extract surl ──────────────────────────────────────────────────────────────
 function extractSurl(rawUrl) {
   if (!rawUrl.startsWith('http')) rawUrl = 'https://' + rawUrl;
   const u = new URL(rawUrl);
@@ -35,7 +35,6 @@ function extractSurl(rawUrl) {
 function parseCookiesToObj(raw) {
   const obj = {};
   if (!raw) return obj;
-  // set-cookie header can be multi-value
   const arr = Array.isArray(raw) ? raw : [raw];
   for (const chunk of arr) {
     for (const part of chunk.split(/,(?=\s*[a-zA-Z_-]+=)/)) {
@@ -65,9 +64,7 @@ async function fetchChain(startUrl, baseHeaders) {
     });
 
     const setCookie = res.headers.get('set-cookie');
-    if (setCookie) {
-      Object.assign(cookies, parseCookiesToObj(setCookie));
-    }
+    if (setCookie) Object.assign(cookies, parseCookiesToObj(setCookie));
 
     if (res.status >= 300 && res.status < 400) {
       let loc = res.headers.get('location') || '';
@@ -85,7 +82,7 @@ async function fetchChain(startUrl, baseHeaders) {
   return { cookies: objToStr(cookies), cookieObj: cookies, html, finalUrl };
 }
 
-// ── Extract tokens from HTML ──────────────────────────────────────────────────
+// ── Extract jsToken + bdstoken from HTML ──────────────────────────────────────
 function extractTokens(html) {
   const jsTokenPatterns = [
     /window\.jsToken\s*=\s*["']?([A-Za-z0-9%_+=\/-]{16,})/i,
@@ -98,14 +95,12 @@ function extractTokens(html) {
     const m = html.match(re);
     if (m) { jsToken = decodeURIComponent(m[1]); break; }
   }
-
   const bdstokenMatch = html.match(/bdstoken["'\s:=]+([a-zA-Z0-9]{16,})/);
   const bdstoken = bdstokenMatch ? bdstokenMatch[1] : '';
-
   return { jsToken, bdstoken };
 }
 
-// ── Single fetch attempt ──────────────────────────────────────────────────────
+// ── Safe JSON fetch ───────────────────────────────────────────────────────────
 async function tryFetch(url, headers) {
   try {
     const res = await fetch(url, { headers });
@@ -116,15 +111,54 @@ async function tryFetch(url, headers) {
   } catch { return null; }
 }
 
+// ── Resolve folders recursively ───────────────────────────────────────────────
+async function resolveFiles(list, surl, apiHeaders, jsToken, host, depth = 0) {
+  if (depth > 3) return list; // max 3 levels deep
+  const allFiles = [];
+
+  for (const f of list) {
+    if (f.isdir && f.path) {
+      const dirPath = encodeURIComponent(f.path);
+      const d = await tryFetch(
+        `https://${host}/share/list?app_id=250528&shorturl=${surl}&root=0` +
+        `&dir=${dirPath}&page=1&num=100&order=time&desc=1` +
+        `&jsToken=${encodeURIComponent(jsToken)}`,
+        apiHeaders
+      );
+      if (d?.errno === 0 && d.list?.length) {
+        const nested = await resolveFiles(d.list, surl, apiHeaders, jsToken, host, depth + 1);
+        allFiles.push(...nested);
+      } else {
+        // path nahi mila, fs_id se try karo
+        const d2 = await tryFetch(
+          `https://${host}/share/list?app_id=250528&shorturl=${surl}&root=0` +
+          `&fid=${f.fs_id}&page=1&num=100&order=time&desc=1` +
+          `&jsToken=${encodeURIComponent(jsToken)}`,
+          apiHeaders
+        );
+        if (d2?.errno === 0 && d2.list?.length) {
+          const nested2 = await resolveFiles(d2.list, surl, apiHeaders, jsToken, host, depth + 1);
+          allFiles.push(...nested2);
+        } else {
+          allFiles.push(f); // as-is
+        }
+      }
+    } else {
+      allFiles.push(f);
+    }
+  }
+
+  return allFiles;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function getTeraboxLinks(shareUrl) {
   const surl = extractSurl(shareUrl);
   const parsedUrl = new URL(shareUrl.startsWith('http') ? shareUrl : 'https://' + shareUrl);
-  const originHost = parsedUrl.hostname; // e.g. teraboxapp.com
-
+  const originHost = parsedUrl.hostname;
   const pageUrl = `https://${originHost}/s/${surl}`;
 
-  // Step 1 — collect session via redirect chain
+  // Step 1 — collect session
   const { cookies, html, finalUrl } = await fetchChain(pageUrl, {
     'User-Agent': UA_DESKTOP,
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -144,60 +178,61 @@ async function getTeraboxLinks(shareUrl) {
     'X-Requested-With': 'XMLHttpRequest',
   };
 
-  const mobileHeaders = {
-    ...apiHeaders,
-    'User-Agent': UA_MOBILE,
-    Referer: `https://${originHost}/s/${surl}`,
-  };
-
   const jtEncoded = encodeURIComponent(jsToken);
   const hosts = [...new Set([finalHost, originHost, 'www.terabox.com'])];
   let lastData = null;
 
   for (const h of hosts) {
-    // share/list
+    // Endpoint A: share/list
     let d = await tryFetch(
-      `https://${h}/share/list?app_id=250528&shorturl=${surl}&root=1&page=1&num=20&order=time&desc=1&jsToken=${jtEncoded}&bdstoken=${bdstoken}`,
+      `https://${h}/share/list?app_id=250528&shorturl=${surl}&root=1` +
+      `&page=1&num=100&order=time&desc=1&jsToken=${jtEncoded}&bdstoken=${bdstoken}`,
       { ...apiHeaders, Referer: `https://${h}/s/${surl}` }
     );
-    if (d?.errno === 0) return formatResult(d, surl);
+    if (d?.errno === 0) {
+      const resolved = await resolveFiles(d.list || [], surl, apiHeaders, jsToken, h);
+      return formatResult({ ...d, list: resolved }, surl);
+    }
     if (d) lastData = d;
 
-    // shorturlinfo
+    // Endpoint B: shorturlinfo
     d = await tryFetch(
       `https://${h}/api/shorturlinfo?app_id=250528&shorturl=${surl}&root=1&jsToken=${jtEncoded}`,
       { ...apiHeaders, Referer: `https://${h}/s/${surl}` }
     );
-    if (d?.errno === 0) return formatResult(d, surl);
-    if (d) lastData = d;
-
-    // mobile share/list
-    d = await tryFetch(
-      `https://${h}/share/list?app_id=250528&shorturl=${surl}&root=1&page=1&num=20&order=time&desc=1&jsToken=${jtEncoded}`,
-      mobileHeaders
-    );
-    if (d?.errno === 0) return formatResult(d, surl);
-    if (d) lastData = d;
-  }
-
-  // Report last known error
-  if (lastData) {
-    if (lastData.errno === 105) {
-      throw new Error(
-        `errno 105: TeraBox blocked this server IP (Vercel/AWS). ` +
-        `Debug — jsToken extracted: ${jsToken ? 'YES (' + jsToken.slice(0,12) + '...)' : 'NO'}, ` +
-        `cookies: ${cookies ? cookies.slice(0, 60) + '...' : 'none'}`
-      );
+    if (d?.errno === 0) {
+      const resolved = await resolveFiles(d.list || [], surl, apiHeaders, jsToken, h);
+      return formatResult({ ...d, list: resolved }, surl);
     }
-    throw new Error(`TeraBox error ${lastData.errno}: ${lastData.errmsg || 'Unknown'}`);
+    if (d) lastData = d;
+
+    // Endpoint C: mobile UA
+    d = await tryFetch(
+      `https://${h}/share/list?app_id=250528&shorturl=${surl}&root=1` +
+      `&page=1&num=100&order=time&desc=1&jsToken=${jtEncoded}`,
+      { ...apiHeaders, 'User-Agent': UA_MOBILE, Referer: `https://${h}/s/${surl}` }
+    );
+    if (d?.errno === 0) {
+      const resolved = await resolveFiles(d.list || [], surl, apiHeaders, jsToken, h);
+      return formatResult({ ...d, list: resolved }, surl);
+    }
+    if (d) lastData = d;
   }
 
-  throw new Error('All endpoints failed — TeraBox returned no JSON response');
+  if (lastData) {
+    throw new Error(
+      `TeraBox error ${lastData.errno}: ${lastData.errmsg || 'Unknown'} | ` +
+      `jsToken: ${jsToken ? 'YES(' + jsToken.slice(0, 10) + '...)' : 'NO'} | ` +
+      `cookies: ${cookies ? cookies.slice(0, 50) + '...' : 'none'}`
+    );
+  }
+
+  throw new Error('All endpoints failed — no JSON response from TeraBox');
 }
 
-// ── Format output ─────────────────────────────────────────────────────────────
+// ── Format final output ───────────────────────────────────────────────────────
 function formatResult(data, surl) {
-  const list = data.list || data.records || [];
+  const list = data.list || [];
   const files = list.map((f) => ({
     filename: f.server_filename,
     size: formatBytes(f.size),
@@ -207,13 +242,27 @@ function formatResult(data, surl) {
     dlink: f.dlink || null,
     thumbnail: f.thumbs?.url3 || null,
     category: f.category,
+    path: f.path || null,
   }));
+
   const download_links = files
     .filter((f) => !f.is_dir && f.dlink)
-    .map((f) => ({ filename: f.filename, size: f.size, download_url: f.dlink }));
-  return { surl, share_title: data.share_title || '', total_files: files.length, files, download_links };
+    .map((f) => ({
+      filename: f.filename,
+      size: f.size,
+      download_url: f.dlink,
+    }));
+
+  return {
+    surl,
+    share_title: data.share_title || '',
+    total_files: files.length,
+    files,
+    download_links,
+  };
 }
 
+// ── Utility ───────────────────────────────────────────────────────────────────
 function formatBytes(bytes) {
   if (!bytes) return '0 B';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
